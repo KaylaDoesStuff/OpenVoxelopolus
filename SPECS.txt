@@ -1,0 +1,203 @@
+================================================================================
+  PROJECT: Voxel Engine - Procedural Terrain + GLSL Shaders + CPU Shadows
+  ROOT:    /home/kayla/Desktop/Opencode
+  BUILD:   make  (gcc -Wall, no warnings)
+================================================================================
+
+FILES:
+  cube.c      — Main entry, GLUT loop, input, physics, chunk orchestration
+  chunk.c     — Chunk data structures, terrain generation, ray casting, quad emission
+  chunk.h     — ChunkData struct, extern world[], function declarations
+  render.c    — VBO batching, frustum culling, GL draw call, HUD, sun billboard
+  render.h    — Renderer function declarations
+  shader.c    — GLSL program compilation, lighting uniforms
+  shader.h    — Shader function declarations
+  blocks.h    — BlockType enum, light direction constants, shadow factor
+  noise.h/c   — Seeded Perlin noise, fBm
+  Makefile    — Multi-source build
+
+================================================================================
+TERRAIN:
+  - Seeded Perlin noise + fBm (scale 0.006, 5 octaves, lacunarity 2.0, gain 0.5)
+  - Base terrain height 8, amplitude 16, max ~24 blocks
+  - Surface: BLOCK_GRASS (y>0) or BLOCK_STONE (y<=0)
+  - Below surface: 4 layers BLOCK_DIRT, then BLOCK_STONE
+  - Y range: -63 to 255  (16 above-ground layers + 4 underground layers)
+  - Above-ground chunks (cy < 0) created in display() loop
+  - Random seed per run via time(NULL) in noiseSeed()
+
+================================================================================
+PLAYER:
+  - Height: 1.8 (crouch 1.5 with C key)
+  - X-radius: 0.3 (width 0.6), Z-radius: 0.2 (depth 0.4)
+  - Speed: 0.064 per frame (~4 blk/s at 60 fps)
+  - Jump: 4.85 m/s (clears ~1.1 blocks)
+  - Gravity: -9.81 m/s^2
+  - Air resistance: rho=1.225, Cd=0.8, A=0.35, mass=70 → terminal ~63 m/s
+  - Binary-search collision resolution for landing / head-bump
+  - onGround state tracked each frame
+  - Camera update in idle() with 16 ms elapsed-time gate
+
+================================================================================
+CHUNK SYSTEM:
+  - 16x16x16 block grid per chunk
+  - Static allocation: world[MAX_CHUNKS=16384] hash table (open addressing)
+  - chunkHash: (cx*73856093 ^ cy*19349663 ^ cz*83492791) & (MAX_CHUNKS-1)
+  - getBlock / blockExists traverse through hash lookup
+  - blockToChunkY converts integer block Y to chunk Y coordinate
+  - getOrCreateChunk fills terrain and invalidates neighbors
+  - MAX_FILL_VERTS = 98304 per chunk buffer (each vertex = 9 floats)
+
+================================================================================
+CHUNK GEOMETRY GENERATION (generateChunk in chunk.c):
+  - 6 face loops: TOP (+Y), BOTTOM (-Y), FRONT (+Z), BACK (-Z), RIGHT (+X), LEFT (-X)
+  - Face visibility: check if adjacent cell (in face normal direction) is BLOCK_AIR
+  - Quad merging (greedy mesh): merge contiguous blocks of same type
+  - 6 faces × 16×16 grid per Y-layer → O(n) merge
+
+  TOP (+Y), BACK (-Z), RIGHT (+X) — PER-VERTEX SHADOW FACES:
+    For each block in the merged quad:
+      - blockColor() → base color
+      - 4 corner vertices checked with rayCastBlock() toward LIGHT_DIR (maxDist=30)
+      - If ray hits another block, vertex color *= SHADOW_FACTOR (0.3)
+      - 6 VERTEX calls per quad (2 triangles, flat shading):
+        Triangle A (v1→v2→v3): provoking vertex v3 → solid SHADOWED side
+        Triangle B (v0→v3→v1): provoking vertex v1 → solid LIT side
+      - Diagonal from v3→v1 follows sunlight direction
+
+  BOTTOM (-Y), FRONT (+Z), LEFT (-X) — FLAT FACES:
+    EMIT_QUAD_TRI emits 6 vertices (2 triangles, single color)
+    Same color on both triangles → no visible diagonal
+
+  TOTAL VERTEX COUNT: 6 per quad (6 verts × ~4000 quads per chunk ≈ ~24000 verts)
+
+================================================================================
+SHADERS (shader.c):
+  Vertex shader:
+    #version 120
+    attributes: inPos (0), inNormal (1), inColor (2)
+    varyings: vNormal, vColor (smooth interpolation)
+    gl_Position = gl_ModelViewProjectionMatrix * vec4(inPos, 1.0)
+
+  Fragment shader:
+    varying vColor (smoothly interpolated across triangles)
+    varying vNormal (interpolated normal — same per triangle anyway)
+    diff = max(dot(normalize(vNormal), uLightDir), 0.0)
+    light = uAmbient + (1.0 - uAmbient) * diff
+    gl_FragColor = vec4(vColor * light, 1.0)
+    uLightDir = (0.469846, 0.866025, -0.171010) — normalized
+    uAmbient = 0.25
+
+  RENDER PRIMITIVE: glDrawArrays(GL_TRIANGLES, ...)
+
+================================================================================
+RENDER PIPELINE (render.c):
+  1. Gather visible chunks' cachedVerts into a single batch buffer
+  2. Upload batch to VBO (GL_ARRAY_BUFFER, GL_STREAM_DRAW)
+  3. Activate shader program → setLightingUniforms()
+  4. Bind vertex attributes (3×float position, 3×float normal, 3×float color)
+  5. glDrawArrays(GL_TRIANGLES, ...)
+  6. Fixed-function sun billboard (yellow concentric circles, camera-facing)
+  7. Wireframe outline on targeted block (rayCastBlock from camera)
+  8. HUD overlay: FPS, CPU%, GPU ms, chunk count, position
+
+  VERTEX FORMAT: 9 floats per vertex
+    [0..2] = position (x, y, z)
+    [3..5] = normal (nx, ny, nz)
+    [6..8] = color (r, g, b)
+
+================================================================================
+SUN & LIGHTING:
+  LIGHT_DIR = (0.469846, 0.866025, -0.171010)
+    → sin(30deg)*cos(20deg), cos(30deg), -sin(30deg)*sin(20deg)
+    → sun at east-north-up; shadow falls toward west-south-down
+
+  Sun billboard at distance 200 along LIGHT_DIR from camera:
+    Outer circle (r=12): RGB(1.0, 0.9, 0.2) medium yellow
+    Inner circle (r=5):  RGB(1.0, 1.0, 0.5) bright yellow
+    Occluded by geometry (depth test enabled)
+
+  Ambient: 0.25 (25% fill light even on backfaces)
+
+================================================================================
+CPU SHADOW (chunk.c):
+  Per-block-face-center ray-cast shadow via rayCastBlock():
+
+    rayCastBlock(ox, oy, oz, dx, dy, dz, maxDist,
+                 &outBX, &outBY, &outBZ, &fnx, &fny, &fnz)
+    - Normalizes direction internally
+    - Standard DDA through integer grid
+    - skipFirst=1 on starting cell
+    - Returns 1 if a solid block is found within maxDist (SHADOW_RAY_DIST=60)
+
+  SHADOW_FACTOR = 0.3 (shadowed quads have color multiplied by 0.3)
+
+  Only applied to 3 sun-facing face types:
+    TOP    (+Y): dot(LIGHT_DIR, +Y) =  0.866 > 0  ✓
+    BACK   (-Z): dot(LIGHT_DIR, -Z) =  0.171 > 0  ✓
+    RIGHT  (+X): dot(LIGHT_DIR, +X) =  0.470 > 0  ✓
+    BOTTOM (-Y): dot = -0.866 < 0 → ambient only
+    FRONT  (+Z): dot = -0.171 < 0 → ambient only
+    LEFT   (-X): dot = -0.470 < 0 → ambient only
+
+===============================================================================
+SHADOW-AWARE GREEDY MESH:
+  Each face block on TOP/BACK/RIGHT casts 1 shadow ray from its face center.
+  Greedy merging requires both: same block type AND same shadow state.
+  Each merged quad emits a single uniform color via EMIT_QUAD_TRI:
+    - If shadowed: color *= SHADOW_FACTOR
+    - If lit: color unchanged
+  → No T-junction seams (shared edges match exactly)
+  → Hard block-aligned shadow edges (classic Minecraft-style)
+
+  For non-sun-facing faces (BOTTOM/FRONT/LEFT):
+    EMIT_QUAD_TRI with uniform color, no shadow check
+
+================================================================================
+KEYS:
+  W/A/S/D    — Move forward/left/backward/right
+  Space      — Jump
+  C          — Crouch (height 1.5)
+  F / G      — Increase / decrease render distance
+  F11        — Toggle fullscreen
+  I / O      — Increase / decrease mouse sensitivity
+  +/-        — Increase / decrease FOV
+  ESC        — Exit
+  Left click — Break targeted block
+  Right click — Place stone block on targeted face
+
+================================================================================
+BLOCK COLORS:
+  BLOCK_GRASS: (0.22, 0.72, 0.18) — green
+  BLOCK_DIRT:  (0.55, 0.35, 0.15) — brown
+  BLOCK_STONE: (0.60, 0.60, 0.60) — grey
+
+================================================================================
+MISC:
+  - VSync disabled at startup (SGI, EXT, MESA interval set to 0)
+  - FPS cap via idle() timer (16 ms gate, ~60 fps max)
+  - Multi-threaded chunk generation (pthread pool, up to 64 threads)
+  - Frustum culling per chunk via getFrustumPlanes + cubeInFrustum
+   - Block removal: invalidate chunk + neighbors; geometry regenerated by
+     thread pool on next frame (no longer synchronous)
+
+===============================================================================
+KNOWN BUGS / ISSUES:
+  1. [FIXED] BACK face shadow diagonal now correctly aligns with sunlight
+     projection (v0→v2 diagonal). RIGHT face was already correct.
+
+  2. [FIXED] maxDist increased to SHADOW_RAY_DIST=60 (from hard-coded 30).
+     Reduces false-positive shadows on tall terrain.
+
+  3. [FIXED] Switched to per-block-center shadow + shadow-aware greedy merge.
+     Each quad has uniform color — no diagonal split, no T-junction seams.
+
+  4. No shadow on BOTTOM/FRONT/LEFT faces — these backfaces only get ambient
+     0.25 from the shader, never the SHADOW_FACTOR multiplier.
+     (by design — ambient-only backfaces are common in voxel engines.)
+
+  5. [FIXED] Chunk regeneration deferred to thread pool. No longer blocks the
+     main thread on block place/break.
+
+  6. [FIXED] visible[] buffer uses static allocation with growable capacity.
+     renderDist capped at 6 to prevent excessive memory use.
